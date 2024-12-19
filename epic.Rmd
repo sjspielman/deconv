@@ -1,0 +1,286 @@
+---
+title: "EPIC exploration"
+output: html_notebook
+---
+
+## Introduction
+
+This notebook prepares data and runs `EPIC` on _one sample_ using the `EPIC` package directly.
+The purpose of this notebook is to confirm we can run this method and understand both inputs and outputs.
+
+Links:
+
+- `EPIC` paper (open): <https://doi.org/10.7554/eLife.26476.001>
+- `EPIC` repo: <https://github.com/GfellerLab/EPIC>
+
+## Setup
+
+```{r setup, warning = FALSE}
+suppressPackageStartupMessages({
+  library(SingleCellExperiment)
+  library(EPIC)
+})
+
+```
+
+Define paths:
+
+```{r}
+data_dir <- "data"
+ref_dir <- "reference"
+
+salmon_quant_file <- file.path(data_dir, "SCPCS000001-quant.sf")
+t2g_file <- file.path(ref_dir, "Homo_sapiens.GRCh38.104.spliced_cdna.tx2gene.tsv")
+processed_rds_file <- file.path(data_dir, "SCPCL000001_processed.rds") # needed for gene id -> symbol
+```
+
+Seed:
+
+```{r}
+set.seed(11)
+```
+
+## Prepare data 
+
+First, we read in files to calculate TPM as input to `EPIC`.
+
+```{r}
+t2g_table <- readr::read_tsv(t2g_file, col_names = c("transcript_id", "gene_id"))
+salmon <- (salmon_quant_file)
+
+# The txi_salmon$abundance calculations here are TPM, and rownames are ensembl IDs
+txi_salmon <- tximport::tximport(salmon_quant_file, type = "salmon", tx2gene = t2g_table)
+
+tpm <- txi_salmon$abundance[,1]
+ensembl_ids <- names(tpm)
+```
+
+Next, we need to convert the ensembl IDs to gene symbols. 
+We'll use this bulk sample's corresponding SCE object to help:
+```{r}
+sce <- readRDS(processed_rds_file)
+map_table <- data.frame(
+  gene_ids = rowData(sce)$gene_ids, 
+  gene_symbol = rowData(sce)$gene_symbol
+)
+
+# Quick map!
+symbol_ids <- data.frame(gene_ids = ensembl_ids) |>
+  dplyr::left_join(map_table, by = "gene_ids") |>
+  dplyr::mutate(gene_symbol = ifelse(is.na(gene_symbol), gene_ids, gene_symbol))
+```
+
+```{r}
+# Confirm our order is ok before swapping over:
+all.equal(ensembl_ids, symbol_ids$gene_ids)
+```
+
+Now, we can make a matrix to provide to deconvolution; one sample to get the code up and running. 
+
+```{r}
+bulk_mat <- matrix(tpm)
+colnames(bulk_mat) <- "SCPCS000001"
+rownames(bulk_mat) <- symbol_ids$gene_symbol
+```
+
+Matrix looks like a matrix, which is always nice to see. 
+```{r}
+bulk_mat |> head()
+```
+
+## Deconvolute
+
+Next, we'll run `EPIC` with `EPIC()`.
+Here's some of the args we should be aware of:
+
+#### `bulk`
+
+An m x n matrix with m genes and n samples; should be TPM, RPKM, or FPKM.
+
+#### `reference` (optional)
+
+This determines the reference to use during deconvolution:
+
+- The default is `TRef`, a built-in reference, described in docs as:
+  - _A dataset containing the reference profiles obtained from various tumor infiltrating non-malignant cell types: B cells, cancer-associated fibroblasts, CD4 T cells, CD8 T cells, endothelial cells, Macrophages and NK cells._
+- You can also specify `BRef`, a different built-in reference:
+  - _A dataset containing the reference profiles obtained from immune cell samples of B cells, CD4 T cells, CD8 T cells, Monocytes, NK cells and Neutrophils, purified from PBMC or whole blood._
+- A list providing a custom reference with the following fields:
+  - `refProfiles`: a matrix (nGenes x nCellTypes) of the reference cells genes expression
+  - `sigGenes`: Character vector of gene names to use as signature
+  - `refProfiles.var`: Optionally, a matrix (nGenes x nCellTypes) of the variability of each gene expression for each cell type, which is used to define weights on each gene for the optimization 
+  
+Let's see what `TRef` looks like, to get a sense:
+
+```{r}
+names(TRef) |>
+  purrr::walk(
+    \(x) {
+      print(x)
+      print(head(TRef[[x]]))
+    }
+  )
+```
+  
+
+### `mRNA_cell` and `mRNA_cell_sub`
+
+THese are both optional arguments:
+
+- `mRNA_cell`: A named numeric vector with values in arbitrary units providing the amount of mRNA for each of the reference cells and of the other uncharacterized (cancer) cell. 
+- `mRNA_cell_sub`:  This can be given instead of `mRNA_cell` (or in addition to it). It is also a named numeric vector, used to replace only the mRNA/cell values from some cell types
+
+
+### `sigGenes`
+
+Optional vector of gene names to use as signature during devonvolution.
+If provided, this will override the values that are part of the reference.
+
+---
+
+We'll run it now with both built-in references as a proof of concept:
+
+```{r}
+epic_tref <- EPIC(
+  bulk = bulk_mat, 
+  reference = "TRef"
+)
+```
+This ran essentially instantaneously on a single sample; not even worth measuring a runtime.
+The output is a list with three matrices, with the field we're most interested in bolded (`cellFractions`):
+
+- `mRNAProportions`: the proportion of mRNA coming from all cell types with a ref profile + the uncharacterized other cell
+- **`cellFractions`**: this gives the proportion of cells from each cell type after accounting for the mRNA / cell value. 
+- `fit.gof`: a matrix telling the quality for the fit of the signature genes in each sample. It tells if the minimization converged, and other info about this fit comparing the measured gene expression in the sigGenes vs predicted gene expression in the sigGenes.
+
+
+Let's see a bit more about the apparent lack of convergence first. 
+The `EPIC` repo README explains that we can learn more about the lack of convergence from `fit.gof$convergeCode`:
+
+- The error code that usually comes is a “1” which means that the maximum number of iterations has been reached in the optimization.
+- From our experience, it seems in practice that even when there was such a warning message the proportions were predicted well, it is maybe that the optimization just wants to be too precise, or maybe few of the signature genes didn’t match well but the rest of signature genes could be used to have a good estimate of the proportions.
+
+Based on the docs, there isn't much one can _do_ about this without directly modifying hard-coded `EPIC` optimization parameters.
+
+```{r}
+epic_tref$fit.gof$convergeCode
+```
+
+Let's run now with `BRef`, and compare the `cellFractions` from both references.
+Both references have these cell types in common: `BCells`, `CD4_Tcells`, `CD8_Tcells`, `NKcells`. 
+Both also have an `otherCells` category, but since references have different cell types in the first place altogether, this isn't something we can directly compare. 
+But, it does give a _very_ qualitative hand-wavey sense of how many cells each reference thinks are more likely to be tumor.
+
+```{r}
+epic_bref <- EPIC::EPIC(
+  bulk = bulk_mat, 
+  reference = "BRef"
+)
+```
+
+```{r}
+tref_fractions <- epic_tref$cellFractions
+bref_fractions <- epic_bref$cellFractions
+
+# we're definitely fractions, right?
+sum(tref_fractions) == 1
+sum(bref_fractions) == 1
+```
+Here are the results, reformatted a bit for easier viewing:
+```{r}
+rownames(tref_fractions) <- "TRef results"
+rownames(bref_fractions) <- "BRef results"
+
+t(tref_fractions) 
+t(bref_fractions)
+```
+
+Let's just print out, for clarity, the cell types they have in common:
+
+```{r}
+shared_cells <- c("Bcells", "CD4_Tcells", "CD8_Tcells", "NKcells")
+
+tref_fractions[,shared_cells]
+bref_fractions[,shared_cells]
+```
+
+For shared cell types, results are on roughly the same order of magnitude except for `CD8_Tcells`, which the `BRef` reference is one order of magnitude higher.
+
+### Using the quanTIseq reference
+
+Let's try using the default `quanTIseq` signature matrix, `TIL10`.
+This matrix is included in the [`immunedeconv` package](https://github.com/omnideconv/immunedeconv/blob/master/inst/extdata/quantiseq/TIL10_signature.txt); it was locally downloaded to the `reference` directory.
+We won't be able to specify the _weights_ for how each much gene in the reference should contribute to each cell type, which is something the built-in `EPIC` references have.
+
+```{r}
+quantiseq_ref <- readr::read_tsv(
+  file.path(ref_dir, "TIL10_signature.txt")
+)
+quantiseq_ref
+```
+
+Let's format this into a reference format for `EPIC`.
+This reference only contains the "signature genes" to use, but the `EPIC` documentation states "It is advised to keep all genes in this refProfiles matrix instead of a subset of signature genes."
+
+So, we'll want to add rows with 0's for genes present in our data matrix that aren't present here, and specify the gene names that are actually in the reference as the signature genes.
+
+```{r}
+# Create matrix from TIL10
+quantiseq_ref_mat <- as.matrix(quantiseq_ref |> dplyr::select(-ID))
+rownames(quantiseq_ref_mat) <- quantiseq_ref$ID
+
+# Determine missing genes and rbind them into the matrix
+missing_genes <- setdiff(rownames(bulk_mat), rownames(quantiseq_ref_mat) )
+missing_gene_mat <- matrix(
+  data = 0, 
+  nrow = length(missing_genes),
+  ncol = ncol(quantiseq_ref_mat)
+)
+rownames(missing_gene_mat) <- missing_genes
+colnames(missing_gene_mat) <- colnames(quantiseq_ref_mat)
+
+full_matrix <- rbind(quantiseq_ref_mat, missing_gene_mat)
+
+# format how EPIC wants it
+quantiseq_ref_for_epic <- list(
+  refProfiles = full_matrix, 
+  sigGenes = rownames(quantiseq_ref_mat)
+)
+```
+
+Let's try it!
+```{r}
+epic_custom <- EPIC::EPIC(
+  bulk = bulk_mat, 
+  reference = quantiseq_ref_for_epic
+)
+t(epic_custom$cellFractions)
+```
+The `quantiseq.nb.html` notebook in this repo contains results from running reference directly in `quanTIseq`, and results here are quite different from what `quanTIseq` inferred; `EPIC` thinks that 99.9% of cells are "other" whereas `quanTIseq` was in the 70-80% range.
+Note that I also tried, rather than `0` for the TPM for missing genes, small values of `1e-4` and `1e-9`; the results were not meaningfully affected.
+
+What happens when we only include the signature genes in the reference and don't add in 0s, as run below?
+We get a message that scaling might be off (note that `scaleExprs = FALSE` leads to an error; but, we do want scaling almost certainly), and the fractions change _substantially_; now there are ~67% "other" cells and many more are characterized.
+This suggests that the `quanTIseq` reference may not be suitable for use with `EPIC`; we really would like a signature reference that contains far more genes in the first place to get the scaling right. 
+Indeed the `BRef` reference has 49902 genes with 98 used as signature, and `TRef` has 23686 genes with 65 used as signature.
+
+```{r}
+epic_custom_onlysig <- EPIC::EPIC(
+  bulk = bulk_mat, 
+  reference = list(
+    refProfiles = quantiseq_ref_mat, 
+    sigGenes = rownames(quantiseq_ref_mat)
+  )
+)
+
+t(epic_custom_onlysig$cellFractions)
+```
+
+
+Based on this _brief_ foray into a non-`EPIC` reference, my sense is that we really want weights in our reference, which might lock us into the built-in `EPIC` ones unless we want to build our own, which seems beyond the scope of the analysis we're aiming for.
+
+## session info
+
+```{r session info}
+sessionInfo()
+```
