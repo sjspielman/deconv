@@ -1,0 +1,215 @@
+---
+title: "quanTIseq exploration"
+output: html_notebook
+---
+
+## Introduction
+
+This notebook prepares data and runs `quanTIseq` on _one sample_ using the `immunedeconv` package, which provides handy wrappers for several popular bulk deconvolution methods.
+The purpose of this notebook is to confirm we can run this method and understand both inputs and outputs.
+
+Links:
+
+- `quanTIseq` paper (open): <https://doi.org/10.1186/s13073-019-0638-6>
+- `quanTIseq` manual: <https://icbi.i-med.ac.at/software/quantiseq/doc/>
+- `immunedeconv` repo: <https://github.com/omnideconv/immunedeconv>
+- `immunedeconv` docs: <https://omnideconv.org/immunedeconv/index.html>
+
+## Setup
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(immunedeconv)
+  library(SingleCellExperiment)
+  library(ggplot2)
+})
+
+```
+
+Define paths:
+
+```{r}
+data_dir <- "data"
+ref_dir <- "reference"
+
+salmon_quant_file <- file.path(data_dir, "SCPCS000001-quant.sf")
+t2g_file <- file.path(ref_dir, "Homo_sapiens.GRCh38.104.spliced_cdna.tx2gene.tsv")
+processed_rds_file <- file.path(data_dir, "SCPCL000001_processed.rds") # needed for gene id -> symbol
+```
+
+Seed:
+
+```{r}
+set.seed(11)
+```
+
+## Prepare data 
+
+First, we read in files to calculate TPM as input to `quanTIseq`.
+
+```{r}
+t2g_table <- readr::read_tsv(t2g_file, col_names = c("transcript_id", "gene_id"))
+salmon <- (salmon_quant_file)
+
+# The txi_salmon$abundance calculations here are TPM, and rownames are ensembl IDs
+txi_salmon <- tximport::tximport(salmon_quant_file, type = "salmon", tx2gene = t2g_table)
+
+tpm <- txi_salmon$abundance[,1]
+ensembl_ids <- names(tpm)
+```
+
+Next, we need to convert the ensembl IDs to gene symbols. 
+We'll use this bulk sample's corresponding SCE object to help:
+```{r}
+sce <- readRDS(processed_rds_file)
+map_table <- data.frame(
+  gene_ids = rowData(sce)$gene_ids, 
+  gene_symbol = rowData(sce)$gene_symbol
+)
+
+# Quick map!
+symbol_ids <- data.frame(gene_ids = ensembl_ids) |>
+  dplyr::left_join(map_table, by = "gene_ids") |>
+  dplyr::mutate(gene_symbol = ifelse(is.na(gene_symbol), gene_ids, gene_symbol))
+```
+
+```{r}
+# Confirm our order is ok before swapping over:
+all.equal(ensembl_ids, symbol_ids$gene_ids)
+```
+
+Now, we can make a matrix to provide to deconvolution; one sample to get the code up and running. 
+
+```{r}
+bulk_mat <- matrix(tpm)
+colnames(bulk_mat) <- "SCPCS000001"
+rownames(bulk_mat) <- symbol_ids$gene_symbol
+```
+
+Matrix looks like a matrix, which is always nice to see. 
+```{r}
+bulk_mat |> head()
+```
+
+## Deconvolute
+Next, we'll run `quanTIseq` using the `immunedeconv` package as a convenient wrapper. 
+We can do this explicitly with `immunedeconv::deconvolute_quantiseq()` which takes args:
+
+#### `gene_expression_matrix`
+
+An m x n matrix with m genes and n samples
+
+#### `tumor`
+
+Set to TRUE if dealing with tumor samples. if TRUE, signature genes with high expression in tumor samples are removed. 
+From the `quanTIseq` manuscript:
+
+
+> Aberrant de-methylation and sequence duplication can lead to over-expression of immune signature genes.
+Tumor RNA-seq data can be analyzed with quanTIseq setting the “--tumor” option to “TRUE”. This setting dis-
+cards the signature genes whose log2(xgl + 1) expression in the TCGA RNA-seq data exceeds 11 TPM, which are NUPR1, CD36, CSTA, HPGD, CFB, ECM1, FCGBP, PLTP, FXYD6, HOPX, SERPING1, ENPP2, GATM, PDPN, ADAM6, FCRLA, and SLC1A3.
+
+Since we are working with pediatric tumor data, it's not immediately clear if this applies, since adult tumors are indeed not pediatric tumors. Might run with both to start..?
+
+#### `arrays`
+
+Set to TRUE if working with Microarray data instead of RNA-seq
+
+--> `FALSE` for us!
+
+#### `scale_mrna`
+
+Set to FALSE to disable correction for cell type-specific differences in mRNA content
+
+From the `quanTIseq` manual:
+
+> `--mRNAscale`: specifies whether cell fractions must be scaled to account for cell-type-specific mRNA content. We highly recommend using the default setting: "--mRNAscale=TRUE".
+
+--> We should use `TRUE`, almost certainly.
+
+---
+
+It's worth noting as well that we can pass native `quanTIseq` arguments in here, _mostly_.
+The original `quanTIseq` implementation starts with trimming FASTQ files and running `kallisto`, so some of those arguments are not relevant to the deconvolution specifically.
+Sadly, this includes `threads`... 
+
+```{r}
+quantiseq_result <- immunedeconv::deconvolute_quantiseq(
+  gene_expression_matrix = bulk_mat, 
+  tumor = FALSE, 
+  arrays = FALSE, 
+  scale_mrna = TRUE
+)
+```
+This took about 1.5 minutes to run with a _single sample_ in the matrix.
+
+The result of `quanTIseq` is a matrix of fractions for immune cells in the sample.
+If there were more samples, we'd have something that looks a bit more compellingly like a matrix!
+
+```{r}
+quantiseq_result
+
+# indeed, sums to 1:
+sum(quantiseq_result)
+```
+
+### Variations
+
+How do these results differ if we were to say this is a tumor sample?
+
+```{r}
+quantiseq_result_tumor <- immunedeconv::deconvolute_quantiseq(
+  gene_expression_matrix = bulk_mat, 
+  tumor = TRUE, # true! 
+  arrays = FALSE, 
+  scale_mrna = TRUE
+)
+quantiseq_result_tumor
+```
+
+When running in tumor mode, we pick up more cell types that weren't previously present.
+
+It can't hurt to peek at where the expression of those genes are relative to the full TPM distribution:
+
+```{r}
+# This is the list noted above from the quanTIseq manuscript, and it's also confirmed here:
+# https://github.com/omnideconv/immunedeconv/blob/12196fb9bc73ef3e220f814a1b3824c289633d4d/inst/extdata/quantiseq/TIL10_TCGA_aberrant_immune_genes.txt#L14
+tumor_genes <- c("NUPR1", "CD36", "CSTA", "HPGD", "CFB", "ECM1", "FCGBP", "PLTP", "FXYD6", "HOPX", "SERPING1", "ENPP2", "GATM", "PDPN", "ADAM6", "FCRLA", "SLC1A3")
+```
+
+```{r}
+tpm_df <- as.data.frame(bulk_mat) |>
+  tibble::rownames_to_column(var = "gene_symbol") |>
+  dplyr::rename(tpm = "SCPCS000001")
+  
+tumor_df <- tpm_df |> dplyr::filter(gene_symbol %in% tumor_genes)
+```
+
+
+The full TPM distribution (all genes, including tumor):
+```{r}
+summary(tpm_df$tpm)
+```
+
+The TPM distribution (all genes, including tumor) of all non-zeros:
+```{r}
+summary(tpm_df$tpm[tpm_df$tpm > 0])
+```
+
+The tumor gene TPMs:
+```{r}
+summary(tumor_df$tpm)
+tumor_df |>
+  # print descending
+  dplyr::arrange(-tpm) 
+```
+
+Indeed, many of these genes have high expression (_at least in this single sample!_), so even though we have pediatric data, we might consider running with `tumor = TRUE`.
+
+(There's a question to be asked here: Are there different genes which should be filtered out in pediatric tumors? Are these diagnosos-specific? Global trends? Specific to certain groups of diagnoses? This is interesting, but beyond the scope!)
+
+## session info
+
+```{r session info}
+sessionInfo()
+```
